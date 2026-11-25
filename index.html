@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<meta name="referrer" content="no-referrer">
+<title>AI Quota Demo</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f5f5f4; --card: #ffffff; --text: #1c1917; --muted: #57534e;
+    --line: #e7e5e4; --track: #e7e5e4; --fill: #2563eb; --high: #c2410c; --full: #b91c1c;
+    --warn-bg: #fef3c7; --warn-text: #78350f; --err-bg: #fee2e2; --err-text: #7f1d1d;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0c0a09; --card: #1c1917; --text: #f5f5f4; --muted: #a8a29e;
+      --line: #292524; --track: #292524; --fill: #60a5fa; --high: #fb923c; --full: #f87171;
+      --warn-bg: #422006; --warn-text: #fde68a; --err-bg: #450a0a; --err-text: #fecaca;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 960px; margin: 0 auto; padding: 20px 16px 40px; }
+  header { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 4px 16px; margin-bottom: 14px; }
+  h1 { font-size: 20px; margin: 0; }
+  #age { color: var(--muted); font-size: 13px; }
+  .banner { border-radius: 8px; padding: 10px 12px; margin: 0 0 14px; font-size: 14px; }
+  .banner.warn { background: var(--warn-bg); color: var(--warn-text); }
+  .banner.err { background: var(--err-bg); color: var(--err-text); }
+  #cards { display: grid; gap: 14px; grid-template-columns: repeat(auto-fill, minmax(min(100%, 280px), 1fr)); }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px; min-width: 0; }
+  .card h2 { font-size: 16px; margin: 0; }
+  .sub { color: var(--muted); font-size: 13px; margin: 2px 0 10px; overflow-wrap: anywhere; }
+  .win { margin-top: 12px; }
+  .row { display: flex; justify-content: space-between; gap: 8px; font-size: 14px; }
+  .row .pct { font-variant-numeric: tabular-nums; font-weight: 600; white-space: nowrap; }
+  .row .pct.unknown { color: var(--muted); font-weight: 400; }
+  .bar { height: 8px; border-radius: 4px; background: var(--track); margin: 5px 0 4px; overflow: hidden; }
+  .bar > span { display: block; height: 100%; background: var(--fill); }
+  .bar.high > span { background: var(--high); }
+  .bar.full > span { background: var(--full); }
+  .bar.unknown { background: repeating-linear-gradient(135deg, var(--track) 0 6px, transparent 6px 12px); border: 1px solid var(--track); }
+  .meta { color: var(--muted); font-size: 12.5px; overflow-wrap: anywhere; }
+  .meta .refusing { color: var(--full); font-weight: 600; }
+  .empty { color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>AI quota demo</h1>
+    <span id="age" aria-live="polite"></span>
+  </header>
+  <div id="banner" class="banner" hidden></div>
+  <div id="cards"></div>
+</main>
+<script>
+(() => {
+  'use strict';
+  const NAMES = { claude: 'Claude', codex: 'Codex', antigravity: 'Antigravity', gemini: 'Gemini' };
+  const STALE_AFTER_MS = 15 * 60 * 1000;
+  const $ = (id) => document.getElementById(id);
+  let snapshot = null;
+
+  function el(tag, cls, text) {
+    const n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text != null) n.textContent = String(text);
+    return n;
+  }
+
+  function parseTime(v) {
+    if (typeof v !== 'string') return null;
+    const t = Date.parse(v);
+    return Number.isNaN(t) ? null : t;
+  }
+
+  function ago(ms) {
+    const min = Math.floor(ms / 60000);
+    if (min < 1) return 'just now';
+    if (min < 60) return min + ' min ago';
+    const h = Math.floor(min / 60);
+    if (h < 48) return h + ' h ' + (min % 60) + ' min ago';
+    return Math.floor(h / 24) + ' days ago';
+  }
+
+  function localTime(t) {
+    const d = new Date(t);
+    const sameDay = d.toDateString() === new Date().toDateString();
+    const opts = sameDay ? { hour: 'numeric', minute: '2-digit' }
+      : { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' };
+    return d.toLocaleString(undefined, opts);
+  }
+
+  function showBanner(kind, text) {
+    const b = $('banner');
+    b.className = 'banner ' + kind;
+    b.textContent = text;
+    b.hidden = false;
+  }
+
+  // The reading time is the OLDER of when the collector wrote status.json
+  // (generatedAt) and when it was exported, so a frozen status.json exported
+  // later still reads as old.
+  function readingTime() {
+    if (!snapshot) return null;
+    const g = parseTime(snapshot.generatedAt);
+    const e = parseTime(snapshot.exportedAt);
+    if (g === null || e === null) return null;
+    return Math.min(g, e);
+  }
+
+  function snapshotFresh() {
+    const t = readingTime();
+    return t !== null;
+  }
+
+  function renderAge() {
+    $('age').textContent = 'Synthetic demo data';
+    $('banner').hidden = true;
+  }
+
+  function resetPassed(win) {
+    const r = parseTime(win.resetsAt);
+    const at = readingTime();
+    return at !== null && r !== null && r <= at;
+  }
+
+  function reasonFor(win, prov) {
+    if (!snapshotFresh()) return 'snapshot old';
+    if (win.expired === true) return 'expired';
+    if (resetPassed(win)) return 'reset since this reading';
+    if (win.suspect === true) return 'looks stuck';
+    if (prov.ok !== true || prov.stale === true) return 'provider stale';
+    return 'no reading';
+  }
+
+  function renderWindow(win, prov) {
+    const box = el('div', 'win');
+    const label = (typeof win.label === 'string' && win.label) || (typeof win.key === 'string' && win.key) || 'Window';
+    const current = win.current === true && typeof win.utilization === 'number' && Number.isFinite(win.utilization)
+      && snapshotFresh() && !resetPassed(win);
+    const row = el('div', 'row');
+    row.append(el('span', 'label', label));
+    const bar = el('div', 'bar');
+    const meta = el('div', 'meta');
+    const parts = [];
+
+    if (current) {
+      const pct = Math.round(win.utilization);
+      const clamped = Math.min(100, Math.max(0, win.utilization));
+      row.append(el('span', 'pct', pct + '%'));
+      bar.setAttribute('role', 'meter');
+      bar.setAttribute('aria-label', label + ' used');
+      bar.setAttribute('aria-valuemin', '0');
+      bar.setAttribute('aria-valuemax', '100');
+      bar.setAttribute('aria-valuenow', String(clamped));
+      bar.setAttribute('aria-valuetext', pct + '% used');
+      if (win.limitReached === true || clamped >= 100) bar.classList.add('full');
+      else if (clamped >= 80) bar.classList.add('high');
+      const fill = el('span');
+      fill.style.width = clamped + '%';
+      bar.append(fill);
+      if (win.limitReached === true) parts.push(el('span', 'refusing', 'refusing calls'));
+    } else {
+      const reason = reasonFor(win, prov);
+      row.append(el('span', 'pct unknown', '-%'));
+      bar.classList.add('unknown');
+      bar.setAttribute('aria-hidden', 'true');
+      parts.push(el('span', 'reason', reason));
+    }
+
+    const reset = parseTime(win.resetsAt);
+    if (reset !== null) {
+      parts.push(el('span', null, (reset > Date.now() ? 'resets ' : 'reset was due ') + localTime(reset)));
+    }
+    parts.forEach((p, i) => { if (i) meta.append(' · '); meta.append(p); });
+    box.append(row, bar, meta);
+    return box;
+  }
+
+  function renderProvider(id, prov) {
+    const card = el('section', 'card');
+    card.setAttribute('aria-label', NAMES[id] || id);
+    card.append(el('h2', null, NAMES[id] || id));
+    const sub = [];
+    if (typeof prov.plan === 'string' && prov.plan) sub.push(prov.plan + ' plan');
+    if (prov.authFailed === true) sub.push('sign-in needed on the Mac');
+    else if (prov.ok !== true) sub.push('last check failed');
+    else if (prov.stale === true) sub.push('stale');
+    const last = parseTime(prov.lastSuccessAt);
+    sub.push(last === null ? 'no successful reading yet' : 'last reading ' + ago(Math.max(0, Date.now() - last)));
+    card.append(el('p', 'sub', sub.join(' · ')));
+    const wins = Array.isArray(prov.windows) ? prov.windows : [];
+    if (!wins.length) card.append(el('p', 'empty', 'No quota windows reported.'));
+    for (const w of wins) if (w && typeof w === 'object') card.append(renderWindow(w, prov));
+    return card;
+  }
+
+  function render() {
+    const cards = $('cards');
+    cards.replaceChildren();
+    renderAge();
+    const providers = snapshot.providers && typeof snapshot.providers === 'object' ? snapshot.providers : {};
+    const ids = Object.keys(providers);
+    if (!ids.length) { cards.append(el('p', 'empty', 'The snapshot lists no providers.')); return; }
+    for (const id of ids) {
+      const p = providers[id];
+      if (p && typeof p === 'object') cards.append(renderProvider(id, p));
+    }
+  }
+
+  function fail(text) {
+    snapshot = null;
+    $('cards').replaceChildren();
+    $('age').textContent = '';
+    showBanner('err', text);
+  }
+
+  async function load() {
+    let data;
+    try {
+      const res = await fetch('./status.json', { cache: 'no-store' });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      data = await res.json();
+    } catch {
+      fail('Could not load the quota snapshot. It may not have been uploaded yet, or the connection failed.');
+      return;
+    }
+    if (!data || typeof data !== 'object' || data.publicSnapshotSchema !== 1) {
+      fail('The quota snapshot is in a format this page does not understand, so nothing is shown.');
+      return;
+    }
+    snapshot = data;
+    render();
+  }
+
+  load();
+  setInterval(() => { if (snapshot) render(); }, 30000);
+  setInterval(load, 5 * 60000);
+})();
+</script>
+</body>
+</html>
